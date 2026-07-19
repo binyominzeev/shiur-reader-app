@@ -35,3 +35,6 @@ next-env.d.ts
 
 # temp job files
 /tmp/shiur-jobs/
+
+.data/shiur-reader.sqlite-shm
+.data/shiur-reader.sqlite-wal
