@@ -1,11 +1,17 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import AudioSelector from '@/components/AudioSelector'
 import PreviewLengthSelector from '@/components/PreviewLengthSelector'
 import GenerateButton from '@/components/GenerateButton'
 import ProgressIndicator from '@/components/ProgressIndicator'
 import TranscriptViewer from '@/components/TranscriptViewer'
+import { clearFolderHandle, loadFolderHandle, saveFolderHandle } from '@/lib/client/folderHandleStore'
+import {
+  type ClientAudioFile,
+  listMp3FilesFromFileList,
+  listMp3FilesFromHandle,
+} from '@/lib/client/folderScan'
 import type { Chunk, JobStatus } from '@/lib/services/transcriptionJob'
 
 interface JobState {
@@ -14,19 +20,74 @@ interface JobState {
   totalChunks: number
   currentChunk: number
   chunks: Chunk[]
+  isCacheHit?: boolean
+  reusedChunks?: number
+  newChunks?: number
+  source?: 'cache' | 'generated'
   error?: string
+}
+
+interface LibraryItem {
+  identityKey: string
+  name: string
+  relativePath: string
+  size: number
+  lastModified: number
+  maxReadyMinutes: number
+  hasFullPreview: boolean
+  file: File | null
 }
 
 const POLL_INTERVAL_MS = 2000
 
+function buildIdentityKey(file: {
+  relativePath: string
+  size: number
+  lastModified: number
+}): string {
+  return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}::${file.lastModified}`
+}
+
 export default function Home() {
-  const [file, setFile] = useState<File | null>(null)
+  const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([])
+  const [selectedIdentity, setSelectedIdentity] = useState<string | null>(null)
+  const [folderHandle, setFolderHandle] = useState<FileSystemDirectoryHandle | null>(null)
+  const [folderStatus, setFolderStatus] = useState<string>('')
+  const [isSyncingLibrary, setIsSyncingLibrary] = useState(false)
   const [previewLength, setPreviewLength] = useState(5)
   const [jobId, setJobId] = useState<string | null>(null)
   const [jobState, setJobState] = useState<JobState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const filesRef = useRef<ClientAudioFile[]>([])
+
+  const supportsDirectoryPicker = useMemo(
+    () => typeof window !== 'undefined' && 'showDirectoryPicker' in window,
+    []
+  )
+
+  const selectedItem = selectedIdentity
+    ? libraryItems.find((item) => item.identityKey === selectedIdentity) ?? null
+    : null
+
+  const missingMinutes = selectedItem
+    ? Math.max(0, previewLength - selectedItem.maxReadyMinutes)
+    : 0
+
+  const generateLabel = selectedItem
+    ? selectedItem.hasFullPreview
+      ? 'Load Saved Preview'
+      : selectedItem.maxReadyMinutes > 0
+        ? `Generate Missing ${missingMinutes} min`
+        : 'Generate Preview'
+    : 'Generate Preview'
+
+  const effectiveFolderStatus = folderStatus || (
+    supportsDirectoryPicker
+      ? 'No folder selected yet.'
+      : 'Persistent folder restore is unavailable in this browser. Use file input mode.'
+  )
 
   const stopPolling = useCallback(() => {
     if (pollRef.current !== null) {
@@ -34,6 +95,116 @@ export default function Home() {
       pollRef.current = null
     }
   }, [])
+
+  const ensureReadPermission = useCallback(
+    async (handle: FileSystemDirectoryHandle, requestPermission: boolean): Promise<boolean> => {
+      const options = { mode: 'read' } as const
+
+      const queryState = await handle.queryPermission(options)
+      if (queryState === 'granted') {
+        return true
+      }
+
+      if (!requestPermission) {
+        return false
+      }
+
+      const requestState = await handle.requestPermission(options)
+      return requestState === 'granted'
+    },
+    []
+  )
+
+  const syncLibraryWithServer = useCallback(async (files: ClientAudioFile[]) => {
+    const res = await fetch('/api/library/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        previewLength,
+        files: files.map((file) => ({
+          name: file.name,
+          relativePath: file.relativePath,
+          size: file.size,
+          lastModified: file.lastModified,
+        })),
+      }),
+    })
+
+    const data = await res.json().catch(() => ({}))
+
+    if (!res.ok) {
+      throw new Error(data.error ?? `Library sync failed with status ${res.status}`)
+    }
+
+    const statusMap = new Map<string, {
+      maxReadyMinutes: number
+      hasFullPreview: boolean
+    }>()
+
+    if (Array.isArray(data.items)) {
+      for (const item of data.items) {
+        if (!item || typeof item !== 'object' || typeof item.identityKey !== 'string') {
+          continue
+        }
+
+        statusMap.set(item.identityKey, {
+          maxReadyMinutes: Number(item.maxReadyMinutes ?? 0),
+          hasFullPreview: Boolean(item.hasFullPreview),
+        })
+      }
+    }
+
+    const mergedItems: LibraryItem[] = files.map((file) => {
+      const identityKey = buildIdentityKey(file)
+      const status = statusMap.get(identityKey)
+      return {
+        identityKey,
+        name: file.name,
+        relativePath: file.relativePath,
+        size: file.size,
+        lastModified: file.lastModified,
+        maxReadyMinutes: status?.maxReadyMinutes ?? 0,
+        hasFullPreview: status?.hasFullPreview ?? false,
+        file: file.file,
+      }
+    })
+
+    setLibraryItems(mergedItems)
+    setSelectedIdentity((previous) => {
+      if (previous && mergedItems.some((item) => item.identityKey === previous)) {
+        return previous
+      }
+      return mergedItems[0]?.identityKey ?? null
+    })
+
+    return mergedItems.length
+  }, [previewLength])
+
+  const refreshFromHandle = useCallback(
+    async (handle: FileSystemDirectoryHandle, requestPermission: boolean) => {
+      setError(null)
+      setIsSyncingLibrary(true)
+
+      try {
+        const hasPermission = await ensureReadPermission(handle, requestPermission)
+        if (!hasPermission) {
+          setFolderStatus('Saved folder found, but read permission is not granted.')
+          return
+        }
+
+        const files = await listMp3FilesFromHandle(handle)
+        filesRef.current = files
+
+        const count = await syncLibraryWithServer(files)
+        setFolderStatus(`Loaded ${count} MP3 files from saved folder.`)
+      } finally {
+        setIsSyncingLibrary(false)
+      }
+    },
+    [ensureReadPermission, syncLibraryWithServer]
+  )
 
   const pollJob = useCallback(async (id: string) => {
     try {
@@ -48,6 +219,15 @@ export default function Home() {
       if (data.status === 'done' || data.status === 'error') {
         stopPolling()
         setIsGenerating(false)
+
+        if (filesRef.current.length > 0) {
+          try {
+            await syncLibraryWithServer(filesRef.current)
+          } catch {
+            // Ignore status refresh errors after completed jobs.
+          }
+        }
+
         if (data.status === 'error') {
           setError(data.error ?? 'An unexpected error occurred.')
         }
@@ -57,7 +237,7 @@ export default function Home() {
       setIsGenerating(false)
       setError(err instanceof Error ? err.message : 'Failed to fetch job status.')
     }
-  }, [stopPolling])
+  }, [stopPolling, syncLibraryWithServer])
 
   useEffect(() => {
     if (!jobId) return
@@ -65,8 +245,127 @@ export default function Home() {
     return () => stopPolling()
   }, [jobId, pollJob, stopPolling])
 
+  useEffect(() => {
+    if (!supportsDirectoryPicker) {
+      return
+    }
+
+    let cancelled = false
+
+    async function restoreFolder() {
+      try {
+        const handle = await loadFolderHandle()
+        if (!handle || cancelled) {
+          return
+        }
+
+        setFolderHandle(handle)
+        await refreshFromHandle(handle, false)
+      } catch {
+        if (!cancelled) {
+          setFolderStatus('Could not restore saved folder. Please select it again.')
+        }
+      }
+    }
+
+    void restoreFolder()
+
+    return () => {
+      cancelled = true
+    }
+  }, [refreshFromHandle, supportsDirectoryPicker])
+
+  useEffect(() => {
+    if (filesRef.current.length === 0) {
+      return
+    }
+
+    void (async () => {
+      try {
+        await syncLibraryWithServer(filesRef.current)
+      } catch {
+        // Ignore silent refresh failures when only changing preview length.
+      }
+    })()
+  }, [previewLength, syncLibraryWithServer])
+
+  const handlePickDirectory = useCallback(async () => {
+    if (!supportsDirectoryPicker) {
+      return
+    }
+
+    setError(null)
+    setIsSyncingLibrary(true)
+
+    try {
+      const handle = await window.showDirectoryPicker()
+      const hasPermission = await ensureReadPermission(handle, true)
+      if (!hasPermission) {
+        setFolderStatus('Folder permission was denied.')
+        return
+      }
+
+      await saveFolderHandle(handle)
+      setFolderHandle(handle)
+
+      const files = await listMp3FilesFromHandle(handle)
+      filesRef.current = files
+
+      const count = await syncLibraryWithServer(files)
+      setFolderStatus(`Selected folder with ${count} MP3 files.`)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return
+      }
+      setError(err instanceof Error ? err.message : 'Failed to select folder.')
+    } finally {
+      setIsSyncingLibrary(false)
+    }
+  }, [ensureReadPermission, supportsDirectoryPicker, syncLibraryWithServer])
+
+  const handleFallbackSelect = useCallback(async (fileList: FileList) => {
+    setError(null)
+    setIsSyncingLibrary(true)
+
+    try {
+      const files = listMp3FilesFromFileList(fileList)
+      filesRef.current = files
+      setFolderHandle(null)
+      await clearFolderHandle()
+
+      const count = await syncLibraryWithServer(files)
+      setFolderStatus(`Loaded ${count} MP3 files from file input.`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load selected files.')
+    } finally {
+      setIsSyncingLibrary(false)
+    }
+  }, [syncLibraryWithServer])
+
+  const handleRefresh = useCallback(async () => {
+    if (folderHandle) {
+      try {
+        await refreshFromHandle(folderHandle, true)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to refresh folder.')
+      }
+      return
+    }
+
+    if (filesRef.current.length > 0) {
+      try {
+        await syncLibraryWithServer(filesRef.current)
+        setFolderStatus(`Refreshed ${filesRef.current.length} MP3 files.`)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to refresh file list.')
+      }
+    }
+  }, [folderHandle, refreshFromHandle, syncLibraryWithServer])
+
   const handleGenerate = useCallback(async () => {
-    if (!file) return
+    if (!selectedItem) {
+      return
+    }
 
     setError(null)
     setJobState(null)
@@ -75,8 +374,20 @@ export default function Home() {
     stopPolling()
 
     const formData = new FormData()
-    formData.append('file', file)
     formData.append('previewLength', String(previewLength))
+    formData.append('name', selectedItem.name)
+    formData.append('relativePath', selectedItem.relativePath)
+    formData.append('size', String(selectedItem.size))
+    formData.append('lastModified', String(selectedItem.lastModified))
+
+    if (!selectedItem.hasFullPreview) {
+      if (!selectedItem.file) {
+        setIsGenerating(false)
+        setError('File content is unavailable. Please refresh the folder first.')
+        return
+      }
+      formData.append('file', selectedItem.file)
+    }
 
     try {
       const res = await fetch('/api/transcribe', {
@@ -91,11 +402,12 @@ export default function Home() {
       }
 
       setJobId(data.jobId)
+      void pollJob(data.jobId)
     } catch (err) {
       setIsGenerating(false)
       setError(err instanceof Error ? err.message : 'Failed to start transcription.')
     }
-  }, [file, previewLength, stopPolling])
+  }, [pollJob, previewLength, selectedItem, stopPolling])
 
   const isProcessing = isGenerating
   const showProgress =
@@ -115,16 +427,70 @@ export default function Home() {
 
       {/* Controls */}
       <section className="w-full max-w-2xl bg-white rounded-2xl shadow-md p-6 flex flex-col gap-5">
-        <AudioSelector onFileChange={setFile} disabled={isProcessing} />
+        <AudioSelector
+          onPickDirectory={handlePickDirectory}
+          onFallbackSelect={handleFallbackSelect}
+          onRefresh={handleRefresh}
+          hasSavedFolder={folderHandle !== null || libraryItems.length > 0}
+          supportsDirectoryPicker={supportsDirectoryPicker}
+          isSyncing={isSyncingLibrary}
+          disabled={isProcessing}
+        />
+
+        <p className="text-xs text-gray-500">{effectiveFolderStatus}</p>
+
+        <div className="flex flex-col gap-2">
+          <p className="text-sm font-medium text-gray-700">MP3 files</p>
+          <div className="max-h-56 overflow-y-auto border border-gray-200 rounded-lg divide-y divide-gray-100">
+            {libraryItems.length === 0 && (
+              <p className="text-sm text-gray-500 p-3">No MP3 files loaded yet.</p>
+            )}
+
+            {libraryItems.map((item) => {
+              const selected = item.identityKey === selectedIdentity
+              const statusText = item.hasFullPreview
+                ? `${previewLength}m ready`
+                : item.maxReadyMinutes > 0
+                  ? `${item.maxReadyMinutes}m ready`
+                  : 'No preview'
+
+              return (
+                <button
+                  key={item.identityKey}
+                  type="button"
+                  onClick={() => setSelectedIdentity(item.identityKey)}
+                  className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 transition-colors ${
+                    selected ? 'bg-blue-50' : 'hover:bg-gray-50'
+                  }`}
+                >
+                  <span className="text-sm text-gray-800 truncate">{item.relativePath}</span>
+                  <span
+                    className={`text-xs px-2 py-1 rounded-full whitespace-nowrap ${
+                      item.hasFullPreview
+                        ? 'bg-green-100 text-green-700'
+                        : item.maxReadyMinutes > 0
+                          ? 'bg-amber-100 text-amber-700'
+                          : 'bg-gray-100 text-gray-600'
+                    }`}
+                  >
+                    {statusText}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
         <PreviewLengthSelector
           value={previewLength}
           onChange={setPreviewLength}
-          disabled={isProcessing}
+          disabled={isProcessing || isSyncingLibrary}
         />
         <GenerateButton
           onClick={handleGenerate}
-          disabled={isProcessing || !file}
+          disabled={isProcessing || !selectedItem || isSyncingLibrary}
           isGenerating={isGenerating}
+          label={generateLabel}
         />
       </section>
 

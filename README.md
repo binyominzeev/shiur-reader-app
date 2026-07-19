@@ -2,7 +2,7 @@
 
 Shiur Reader is a Next.js web app that turns the first few minutes of a long audio recording into readable text, so users can quickly understand the beginning of a shiur without listening end-to-end.
 
-The app currently supports MP3 input, splits the selected preview window into 1-minute chunks, transcribes each chunk with AssemblyAI, and then lightly formats the transcript with OpenAI for readability.
+The app currently supports MP3 input, splits the selected preview window into 1-minute chunks, transcribes each chunk with AssemblyAI, and then lightly formats the transcript with Gemini (default) or OpenAI for readability.
 
 ## Purpose
 
@@ -12,8 +12,11 @@ The app currently supports MP3 input, splits the selected preview window into 1-
 
 ## Core Features
 
-- Upload audio from the browser.
+- Select an MP3 folder from the browser (persistent on supported browsers).
+- Automatic folder restore on next app open (Android Chrome / PWA).
+- Manual Refresh action to re-scan folder contents after updates.
 - Select preview length: 3, 5, or 10 minutes.
+- Incremental preview generation (reuses existing minutes and generates only missing minutes).
 - Background server job with polling-based progress updates.
 - Chunk-by-chunk transcript rendering with status indicators.
 - Basic PWA installability (manifest + service worker registration).
@@ -24,33 +27,43 @@ The app currently supports MP3 input, splits the selected preview window into 1-
 - UI: React 19 + Tailwind CSS 4
 - Language: TypeScript
 - Speech-to-text: AssemblyAI SDK
-- Transcript cleanup/formatting: OpenAI SDK
+- Transcript cleanup/formatting: Gemini via @google/genai (default) or OpenAI via openai SDK
 - Audio chunk extraction: FFmpeg CLI (invoked from Node)
 - Job IDs: uuid
 
 ## How It Works
 
-1. User uploads an audio file and picks a preview length.
-2. Browser sends multipart form data to POST /api/transcribe.
-3. Server saves the upload to a temporary directory and creates an in-memory job.
-4. A background task processes each 60-second chunk:
+1. User selects an MP3 folder and picks a preview length.
+2. Browser syncs MP3 metadata with POST /api/library/sync.
+3. User picks one MP3 from the synced list and starts preview.
+4. Browser sends multipart form data to POST /api/transcribe.
+5. Server checks SQLite cache first:
+	 - Full hit: returns saved preview immediately.
+	 - Partial hit: generates only missing minutes (for example 3->5 means only minutes 4-5).
+	 - Miss: generates all requested minutes.
+6. New minute chunks are persisted in SQLite as they complete.
+7. A background task processes each 60-second chunk:
 	 - Extract chunk with FFmpeg
 	 - Transcribe chunk with AssemblyAI
-	 - Format transcript text with OpenAI
-5. Browser polls GET /api/transcribe/:jobId every 2 seconds.
-6. UI shows progress and chunk outputs as they complete.
+	 - Format transcript text with Gemini (default) or OpenAI
+8. Browser polls GET /api/transcribe/:jobId every 2 seconds.
+9. UI shows progress and chunk outputs as they complete.
 
 ```mermaid
 flowchart LR
 	U[User Uploads MP3] --> FE[Next.js Client]
+	FE -->|POST /api/library/sync| LIB[Library Sync Route]
+	LIB --> DB[(SQLite)]
 	FE -->|POST /api/transcribe| API1[Transcribe Route]
+	API1 --> DB
 	API1 --> TMP[Write temp input file]
 	TMP --> JOB[In-memory Job Store]
 	JOB --> BG[Background Processor]
 	BG --> FFMPEG[FFmpeg chunk extraction]
 	FFMPEG --> AAI[AssemblyAI transcription]
-	AAI --> OAI[OpenAI formatting]
-	OAI --> JOB
+	AAI --> FMT[Gemini or OpenAI formatting]
+	FMT --> JOB
+	BG --> DB
 	FE -->|poll GET /api/transcribe/:jobId| API2[Job Status Route]
 	API2 --> FE
 ```
@@ -60,6 +73,12 @@ flowchart LR
 ### POST /api/transcribe
 
 Starts a new transcription preview job.
+
+Behavior:
+
+- Cache hit: returns a completed job backed by stored chunks.
+- Partial cache hit: starts job from the first missing minute.
+- Cache miss: starts full generation.
 
 Request:
 
@@ -112,6 +131,26 @@ Response shape:
 }
 ```
 
+### POST /api/library/sync
+
+Registers/syncs current folder MP3 metadata and returns preview availability for the selected preview length.
+
+Request JSON:
+
+```json
+{
+	"previewLength": 5,
+	"files": [
+		{
+			"name": "shiur.mp3",
+			"relativePath": "MyShiurFolder/shiur.mp3",
+			"size": 123456,
+			"lastModified": 1750000000000
+		}
+	]
+}
+```
+
 ## Project Structure
 
 ```text
@@ -120,17 +159,19 @@ app/
 	api/transcribe/[jobId]/route.ts    # GET endpoint: poll job state
 	page.tsx                           # Main client UI and polling logic
 components/
-	AudioSelector.tsx
+	AudioSelector.tsx                     # Folder select + refresh controls
 	PreviewLengthSelector.tsx
 	GenerateButton.tsx
 	ProgressIndicator.tsx
 	TranscriptViewer.tsx
 	ServiceWorkerRegistration.tsx
 lib/services/
+	previewStore.ts                       # SQLite cache/index store
 	transcriptionJob.ts                # Job state model + background loop
 	ffmpeg.ts                          # FFmpeg wrapper
 	assembly.ts                        # AssemblyAI integration
-	openai.ts                          # OpenAI transcript formatting
+	openai.ts                          # Transcript formatting provider (Gemini/OpenAI)
+app/api/library/sync/route.ts          # Folder library sync endpoint
 public/
 	manifest.json
 	sw.js
@@ -142,7 +183,8 @@ public/
 - npm
 - FFmpeg available on PATH
 - AssemblyAI API key
-- OpenAI API key
+- Gemini API key (default formatter)
+- OpenAI API key (optional, for OpenAI formatter)
 
 Install FFmpeg on Ubuntu/Debian:
 
@@ -170,6 +212,8 @@ cp .env.local.example .env.local
 ```env
 ASSEMBLYAI_API_KEY=your_assemblyai_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+TRANSCRIPT_AI_PROVIDER=gemini
 ```
 
 ## Run
@@ -205,12 +249,16 @@ npm run lint
 ## Environment Variables
 
 - ASSEMBLYAI_API_KEY: required, used in lib/services/assembly.ts
-- OPENAI_API_KEY: required, used in lib/services/openai.ts
+- GEMINI_API_KEY: required by default, used when TRANSCRIPT_AI_PROVIDER=gemini
+- OPENAI_API_KEY: required only when TRANSCRIPT_AI_PROVIDER=openai
+- TRANSCRIPT_AI_PROVIDER: optional, gemini (default) or openai
+- GEMINI_MODEL: optional, defaults to gemini-3.1-flash-lite
+- TRANSCRIPT_AI_DEBUG: optional, set true to print transcript formatter request/error debug logs on server
 
 ## Operational Notes
 
-- Jobs are stored in memory only.
-- If the server restarts, all active/completed jobs are lost.
+- Jobs are in memory while running, but generated minute chunks are persisted in SQLite.
+- After server restart, saved preview chunks remain available from SQLite cache.
 - Temporary files are created under OS temp dir and removed after processing.
 - Chunk failures do not stop the whole job; processing continues for later chunks.
 - A job can still finish with status done even if some chunks have status error.
@@ -221,7 +269,7 @@ npm run lint
 - No user authentication or rate limiting.
 - No true offline behavior despite service worker presence.
 - Assumes FFmpeg is installed and callable as ffmpeg.
-- Default OpenAI model is currently hardcoded (gpt-4o-mini).
+- Default models can be overridden via GEMINI_MODEL and OPENAI_MODEL.
 
 ## Troubleshooting
 
@@ -231,12 +279,12 @@ npm run lint
 	- Ensure form field name is file.
 - Error: Preview length must be one of 3, 5, 10
 	- Send a valid previewLength.
-- Error from AssemblyAI/OpenAI
+	- Error from AssemblyAI/Gemini/OpenAI
 	- Check API keys and account quotas.
 
 ## Security and Privacy Considerations
 
-- Uploaded audio is processed server-side and sent to third-party APIs (AssemblyAI and OpenAI).
+- Uploaded audio is processed server-side and sent to third-party APIs (AssemblyAI and Gemini/OpenAI).
 - Do not upload sensitive audio unless your policy allows external processing.
 - Consider adding consent messaging and retention policy documentation before production usage.
 

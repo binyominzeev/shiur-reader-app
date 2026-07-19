@@ -21,25 +21,54 @@ export interface Job {
   completedChunks: number
   currentChunk: number
   chunks: Chunk[]
+  isCacheHit?: boolean
+  reusedChunks?: number
+  newChunks?: number
+  source?: 'cache' | 'generated'
   error?: string
 }
 
 // In-memory job store for single-user MVP
 const jobs = new Map<string, Job>()
 
-export function createJob(jobId: string, totalChunks: number): Job {
-  const chunks: Chunk[] = Array.from({ length: totalChunks }, (_, i) => ({
+interface CreateJobOptions {
+  initialChunks?: Chunk[]
+  status?: JobStatus
+  isCacheHit?: boolean
+  reusedChunks?: number
+  newChunks?: number
+  source?: 'cache' | 'generated'
+}
+
+interface StartProcessingOptions {
+  startMinute?: number
+  onChunkFinalized?: (minuteIndex: number, chunk: Chunk) => Promise<void> | void
+}
+
+export function createJob(jobId: string, totalChunks: number, options?: CreateJobOptions): Job {
+  const fallbackChunks: Chunk[] = Array.from({ length: totalChunks }, (_, i) => ({
     index: i + 1,
-    status: 'pending' as ChunkStatus,
+    status: 'pending',
   }))
+
+  const chunks = options?.initialChunks && options.initialChunks.length === totalChunks
+    ? options.initialChunks
+    : fallbackChunks
+
+  const completedChunks = chunks.filter((chunk) => chunk.status === 'done').length
+  const status = options?.status ?? 'pending'
 
   const job: Job = {
     id: jobId,
-    status: 'pending',
+    status,
     totalChunks,
-    completedChunks: 0,
-    currentChunk: 0,
+    completedChunks,
+    currentChunk: status === 'done' ? totalChunks : completedChunks,
     chunks,
+    isCacheHit: options?.isCacheHit,
+    reusedChunks: options?.reusedChunks,
+    newChunks: options?.newChunks,
+    source: options?.source,
   }
 
   jobs.set(jobId, job)
@@ -53,16 +82,17 @@ export function getJob(jobId: string): Job | undefined {
 export async function startJobProcessing(
   jobId: string,
   inputPath: string,
-  previewMinutes: number,
-  tmpDir: string
+  tmpDir: string,
+  options?: StartProcessingOptions
 ): Promise<void> {
   const job = jobs.get(jobId)
   if (!job) return
 
   job.status = 'processing'
+  const startMinute = options?.startMinute ?? 1
 
   try {
-    for (let i = 0; i < job.totalChunks; i++) {
+    for (let i = startMinute - 1; i < job.totalChunks; i++) {
       const chunk = job.chunks[i]
       const startSeconds = i * 60
       const chunkPath = path.join(tmpDir, `chunk_${i + 1}.mp3`)
@@ -84,13 +114,16 @@ export async function startJobProcessing(
 
         chunk.status = 'done'
         chunk.text = formattedText
+        chunk.error = undefined
         job.completedChunks++
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error'
         chunk.status = 'error'
+        chunk.text = undefined
         chunk.error = message
         // Continue with next chunk even if one fails
       } finally {
+        await options?.onChunkFinalized?.(i + 1, chunk)
         // Clean up the chunk temp file
         await fs.unlink(chunkPath).catch(() => undefined)
       }

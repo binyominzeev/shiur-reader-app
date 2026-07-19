@@ -4,9 +4,10 @@ interface GenerateButtonProps {
   onClick: () => void
   disabled: boolean
   isGenerating: boolean
+  label: string
 }
 
-export default function GenerateButton({ onClick, disabled, isGenerating }: GenerateButtonProps) {
+export default function GenerateButton({ onClick, disabled, isGenerating, label }: GenerateButtonProps) {
   return (
     <button
       type="button"
@@ -36,7 +37,7 @@ export default function GenerateButton({ onClick, disabled, isGenerating }: Gene
           />
         </svg>
       )}
-      {isGenerating ? 'Generating…' : 'Generate Preview'}
+      {isGenerating ? 'Working…' : label}
     </button>
   )
 }

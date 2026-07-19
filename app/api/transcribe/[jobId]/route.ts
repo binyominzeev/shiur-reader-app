@@ -20,6 +20,10 @@ export async function GET(
     totalChunks: job.totalChunks,
     currentChunk: job.currentChunk,
     chunks: job.chunks,
+    isCacheHit: job.isCacheHit,
+    reusedChunks: job.reusedChunks,
+    newChunks: job.newChunks,
+    source: job.source,
     error: job.error,
   })
 }
