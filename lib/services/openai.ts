@@ -37,5 +37,9 @@ export async function formatTranscript(text: string): Promise<string> {
     ],
   })
 
-  return response.choices[0]?.message?.content ?? text
+  const content = response.choices[0]?.message?.content
+  if (!content) {
+    throw new Error('OpenAI returned an empty response')
+  }
+  return content
 }

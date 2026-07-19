@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid'
 import os from 'os'
 import path from 'path'
 import fs from 'fs/promises'
-import { createJob, startJobProcessing } from '@/lib/services/transcriptionJob'
+import { createJob, startJobProcessing, getJob } from '@/lib/services/transcriptionJob'
 
 export const runtime = 'nodejs'
 
@@ -51,6 +51,13 @@ export async function POST(request: NextRequest) {
     // Start background processing — intentionally not awaited
     startJobProcessing(jobId, inputPath, previewLength, tmpDir).catch((err) => {
       console.error(`Job ${jobId} failed:`, err)
+      // Ensure polling clients can observe the failure even if the job manager
+      // did not catch the error itself
+      const job = getJob(jobId)
+      if (job && job.status !== 'done' && job.status !== 'error') {
+        job.status = 'error'
+        job.error = err instanceof Error ? err.message : 'Unexpected server error'
+      }
     })
 
     return NextResponse.json({ jobId })
