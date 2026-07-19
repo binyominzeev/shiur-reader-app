@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { v4 as uuidv4 } from 'uuid'
+import os from 'os'
 import path from 'path'
 import fs from 'fs/promises'
 import { createJob, startJobProcessing } from '@/lib/services/transcriptionJob'
@@ -35,7 +36,7 @@ export async function POST(request: NextRequest) {
   }
 
   const jobId = uuidv4()
-  const tmpDir = `/tmp/shiur-jobs/${jobId}`
+  const tmpDir = path.join(os.tmpdir(), 'shiur-jobs', jobId)
 
   try {
     await fs.mkdir(tmpDir, { recursive: true })

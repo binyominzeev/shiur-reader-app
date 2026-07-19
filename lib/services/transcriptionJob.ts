@@ -103,7 +103,6 @@ export async function startJobProcessing(
     job.error = message
   } finally {
     // Clean up the original input file
-    await fs.unlink(inputPath).catch(() => undefined)
-    await fs.rmdir(tmpDir).catch(() => undefined)
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined)
   }
 }
