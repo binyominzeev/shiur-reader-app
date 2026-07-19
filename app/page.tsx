@@ -63,6 +63,16 @@ function buildIdentityKey(file: {
   return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}`
 }
 
+function normalizeRelativePath(relativePath: string): string {
+  return relativePath.replace(/\\/g, '/').trim()
+}
+
+function getPathTail(relativePath: string): string {
+  const normalized = normalizeRelativePath(relativePath)
+  const segments = normalized.split('/').filter(Boolean)
+  return segments[segments.length - 1] ?? normalized
+}
+
 function getDeviceLabel(): string {
   if (typeof navigator === 'undefined') {
     return 'This device'
@@ -197,6 +207,7 @@ export default function Home() {
   const [pairingMessage, setPairingMessage] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const filesRef = useRef<ClientAudioFile[]>([])
+  const localFileCacheRef = useRef<Map<string, File>>(new Map())
   const lastSourceRef = useRef<SyncSourceInput | null>(null)
   const completedPairTokenRef = useRef<string | null>(null)
   const supportsDirectoryPicker = useSyncExternalStore(
@@ -274,8 +285,26 @@ export default function Home() {
     const source = parseLibrarySource(data.source)
     setLibrarySource(source)
 
+    if (localFiles.length > 0) {
+      for (const file of localFiles) {
+        localFileCacheRef.current.set(buildIdentityKey(file), file.file)
+      }
+    }
+
     const localFilesByIdentity = new Map(
       localFiles.map((file) => [buildIdentityKey(file), file.file] as const)
+    )
+
+    const localFilesByPathAndSize = new Map(
+      localFiles.map((file) => [`${normalizeRelativePath(file.relativePath)}::${file.size}`, file.file] as const)
+    )
+
+    const localFilesByTailAndSize = new Map(
+      localFiles.map((file) => [`${getPathTail(file.relativePath)}::${file.size}`, file.file] as const)
+    )
+
+    const localFilesByNameAndSize = new Map(
+      localFiles.map((file) => [`${file.name}::${file.size}`, file.file] as const)
     )
 
     const nextItems: LibraryItem[] = []
@@ -305,7 +334,13 @@ export default function Home() {
           lastModified: typedItem.lastModified,
           maxReadyMinutes: Number(typedItem.maxReadyMinutes ?? 0),
           hasFullPreview: Boolean(typedItem.hasFullPreview),
-          file: localFilesByIdentity.get(typedItem.identityKey) ?? null,
+          file:
+            localFilesByIdentity.get(typedItem.identityKey) ??
+            localFilesByPathAndSize.get(`${normalizeRelativePath(typedItem.relativePath)}::${typedItem.size}`) ??
+            localFilesByTailAndSize.get(`${getPathTail(typedItem.relativePath)}::${typedItem.size}`) ??
+            localFilesByNameAndSize.get(`${typedItem.name}::${typedItem.size}`) ??
+            localFileCacheRef.current.get(typedItem.identityKey) ??
+            null,
         })
       }
     }
@@ -622,7 +657,7 @@ export default function Home() {
 
     try {
       const files = listMp3FilesFromFileList(fileList)
-      filesRef.current = supportsDirectoryPicker ? files : []
+      filesRef.current = files
 
       const count = await syncLibraryWithServer(files, {
         sourceType: 'file-input',
@@ -635,7 +670,7 @@ export default function Home() {
     } finally {
       setIsSyncingLibrary(false)
     }
-  }, [deviceLabel, supportsDirectoryPicker, syncLibraryWithServer])
+  }, [deviceLabel, syncLibraryWithServer])
 
   const handleRefresh = useCallback(async () => {
     if (!supportsDirectoryPicker) {
@@ -740,12 +775,65 @@ export default function Home() {
     formData.append('lastModified', String(selectedItem.lastModified))
 
     if (!selectedItem.hasFullPreview) {
-      if (!selectedItem.file) {
+      let fileToUpload = selectedItem.file
+
+      const findLocalFileForSelected = (): File | null => {
+        const normalizedSelectedPath = normalizeRelativePath(selectedItem.relativePath)
+        const selectedTail = getPathTail(selectedItem.relativePath)
+
+        const byIdentity = filesRef.current.find(
+          (file) => buildIdentityKey(file) === selectedItem.identityKey
+        )
+        if (byIdentity?.file) {
+          return byIdentity.file
+        }
+
+        const byPathAndSize = filesRef.current.find(
+          (file) =>
+            normalizeRelativePath(file.relativePath) === normalizedSelectedPath &&
+            file.size === selectedItem.size
+        )
+        if (byPathAndSize?.file) {
+          return byPathAndSize.file
+        }
+
+        const byTailAndSize = filesRef.current.find(
+          (file) => getPathTail(file.relativePath) === selectedTail && file.size === selectedItem.size
+        )
+        if (byTailAndSize?.file) {
+          return byTailAndSize.file
+        }
+
+        const byNameAndSize = filesRef.current.find(
+          (file) => file.name === selectedItem.name && file.size === selectedItem.size
+        )
+        if (byNameAndSize?.file) {
+          return byNameAndSize.file
+        }
+
+        return null
+      }
+
+      if (!fileToUpload) {
+        fileToUpload = findLocalFileForSelected()
+      }
+
+      if (!fileToUpload && folderHandle) {
+        try {
+          await refreshFromHandle(folderHandle, true)
+          fileToUpload = findLocalFileForSelected()
+        } catch {
+          // The final message below gives the actionable next step.
+        }
+      }
+
+      if (!fileToUpload) {
         setIsGenerating(false)
         setError('File content is unavailable. Please refresh the folder first.')
         return
       }
-      formData.append('file', selectedItem.file)
+
+      formData.append('file', fileToUpload)
     }
 
     try {
@@ -775,7 +863,7 @@ export default function Home() {
       setIsGenerating(false)
       setError(err instanceof Error ? err.message : 'Failed to start transcription.')
     }
-  }, [pollJob, previewLength, selectedItem, stopPolling])
+  }, [folderHandle, pollJob, previewLength, refreshFromHandle, selectedItem, stopPolling])
 
   const isProcessing = isGenerating
   const showProgress =
@@ -875,11 +963,13 @@ export default function Home() {
                   key={item.identityKey}
                   type="button"
                   onClick={() => setSelectedIdentity(item.identityKey)}
-                  className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 transition-colors ${
+                  className={`w-full text-left px-3 py-2 flex items-start justify-between gap-3 transition-colors ${
                     selected ? 'bg-blue-50' : 'hover:bg-gray-50'
                   }`}
                 >
-                  <span className="text-sm text-gray-800 truncate">{item.relativePath}</span>
+                  <span className="text-sm text-gray-800 whitespace-normal break-all min-w-0 flex-1">
+                    {item.relativePath}
+                  </span>
                   <span
                     className={`text-xs px-2 py-1 rounded-full whitespace-nowrap ${
                       item.hasFullPreview
