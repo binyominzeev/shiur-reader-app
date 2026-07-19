@@ -6,7 +6,7 @@ import PreviewLengthSelector from '@/components/PreviewLengthSelector'
 import GenerateButton from '@/components/GenerateButton'
 import ProgressIndicator from '@/components/ProgressIndicator'
 import TranscriptViewer from '@/components/TranscriptViewer'
-import { clearFolderHandle, loadFolderHandle, saveFolderHandle } from '@/lib/client/folderHandleStore'
+import { loadFolderHandle, saveFolderHandle } from '@/lib/client/folderHandleStore'
 import {
   type ClientAudioFile,
   listMp3FilesFromFileList,
@@ -43,9 +43,32 @@ const POLL_INTERVAL_MS = 2000
 function buildIdentityKey(file: {
   relativePath: string
   size: number
-  lastModified: number
 }): string {
-  return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}::${file.lastModified}`
+  return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}`
+}
+
+function buildStatusLookupKey(file: {
+  relativePath: string
+  size: number
+}): string {
+  return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}`
+}
+
+async function parseApiJson(response: Response): Promise<Record<string, unknown>> {
+  const raw = await response.text()
+
+  if (!raw) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    const preview = raw.slice(0, 140).replace(/\s+/g, ' ').trim()
+    throw new Error(
+      `Non-JSON response from ${response.url} (status ${response.status}): ${preview || 'empty body'}`
+    )
+  }
 }
 
 export default function Home() {
@@ -132,10 +155,14 @@ export default function Home() {
       }),
     })
 
-    const data = await res.json().catch(() => ({}))
+    const data = await parseApiJson(res)
 
     if (!res.ok) {
-      throw new Error(data.error ?? `Library sync failed with status ${res.status}`)
+      throw new Error(
+        typeof data.error === 'string'
+          ? data.error
+          : `Library sync failed with status ${res.status}`
+      )
     }
 
     const statusMap = new Map<string, {
@@ -149,7 +176,21 @@ export default function Home() {
           continue
         }
 
-        statusMap.set(item.identityKey, {
+        const typedItem = item as {
+          relativePath?: unknown
+          size?: unknown
+          maxReadyMinutes?: unknown
+          hasFullPreview?: unknown
+        }
+
+        if (typeof typedItem.relativePath !== 'string' || typeof typedItem.size !== 'number') {
+          continue
+        }
+
+        statusMap.set(buildStatusLookupKey({
+          relativePath: typedItem.relativePath,
+          size: typedItem.size,
+        }), {
           maxReadyMinutes: Number(item.maxReadyMinutes ?? 0),
           hasFullPreview: Boolean(item.hasFullPreview),
         })
@@ -158,7 +199,7 @@ export default function Home() {
 
     const mergedItems: LibraryItem[] = files.map((file) => {
       const identityKey = buildIdentityKey(file)
-      const status = statusMap.get(identityKey)
+      const status = statusMap.get(buildStatusLookupKey(file))
       return {
         identityKey,
         name: file.name,
@@ -209,14 +250,20 @@ export default function Home() {
   const pollJob = useCallback(async (id: string) => {
     try {
       const res = await fetch(`/api/transcribe/${id}`)
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.error ?? `Server error ${res.status}`)
-      }
-      const data: JobState = await res.json()
-      setJobState(data)
+      const data = await parseApiJson(res)
 
-      if (data.status === 'done' || data.status === 'error') {
+      if (!res.ok) {
+        throw new Error(
+          typeof data.error === 'string'
+            ? data.error
+            : `Server error ${res.status}`
+        )
+      }
+
+      const nextState = data as unknown as JobState
+      setJobState(nextState)
+
+      if (nextState.status === 'done' || nextState.status === 'error') {
         stopPolling()
         setIsGenerating(false)
 
@@ -228,8 +275,8 @@ export default function Home() {
           }
         }
 
-        if (data.status === 'error') {
-          setError(data.error ?? 'An unexpected error occurred.')
+        if (nextState.status === 'error') {
+          setError(nextState.error ?? 'An unexpected error occurred.')
         }
       }
     } catch (err) {
@@ -298,7 +345,7 @@ export default function Home() {
     setIsSyncingLibrary(true)
 
     try {
-      const handle = await window.showDirectoryPicker()
+      const handle = await window.showDirectoryPicker({ id: 'shiur-reader-mp3-folder' })
       const hasPermission = await ensureReadPermission(handle, true)
       if (!hasPermission) {
         setFolderStatus('Folder permission was denied.')
@@ -330,8 +377,6 @@ export default function Home() {
     try {
       const files = listMp3FilesFromFileList(fileList)
       filesRef.current = files
-      setFolderHandle(null)
-      await clearFolderHandle()
 
       const count = await syncLibraryWithServer(files)
       setFolderStatus(`Loaded ${count} MP3 files from file input.`)
@@ -395,14 +440,23 @@ export default function Home() {
         body: formData,
       })
 
-      const data = await res.json()
+      const data = await parseApiJson(res)
 
       if (!res.ok) {
-        throw new Error(data.error ?? `Upload failed with status ${res.status}`)
+        throw new Error(
+          typeof data.error === 'string'
+            ? data.error
+            : `Upload failed with status ${res.status}`
+        )
       }
 
-      setJobId(data.jobId)
-      void pollJob(data.jobId)
+      const nextJobId = typeof data.jobId === 'string' ? data.jobId : null
+      if (!nextJobId) {
+        throw new Error('Transcribe endpoint did not return a valid jobId.')
+      }
+
+      setJobId(nextJobId)
+      void pollJob(nextJobId)
     } catch (err) {
       setIsGenerating(false)
       setError(err instanceof Error ? err.message : 'Failed to start transcription.')

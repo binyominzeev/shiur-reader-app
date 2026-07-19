@@ -6,8 +6,8 @@ import fs from 'fs/promises'
 import type { Chunk } from '@/lib/services/transcriptionJob'
 import { createJob, startJobProcessing, getJob } from '@/lib/services/transcriptionJob'
 import {
-  buildIdentityKey,
   getChunksForPreview,
+  getIdentityKeyForFile,
   getReusePlan,
   saveMinuteChunk,
   upsertAudioFiles,
@@ -64,7 +64,7 @@ export async function POST(request: NextRequest) {
 
   upsertAudioFiles([identity])
 
-  const identityKey = buildIdentityKey(identity)
+  const identityKey = getIdentityKeyForFile(identity)
   const reusePlan = getReusePlan(identityKey, previewLength)
 
   if (reusePlan.readyMinutes >= previewLength) {

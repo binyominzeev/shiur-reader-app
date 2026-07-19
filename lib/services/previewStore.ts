@@ -70,7 +70,55 @@ function normalizePath(relativePath: string): string {
 
 export function buildIdentityKey(file: AudioFileIdentityInput): string {
   const normalizedRelativePath = normalizePath(file.relativePath)
+  return `${normalizedRelativePath}::${file.size}`
+}
+
+function buildLegacyIdentityKey(file: AudioFileIdentityInput): string {
+  const normalizedRelativePath = normalizePath(file.relativePath)
   return `${normalizedRelativePath}::${file.size}::${file.lastModified}`
+}
+
+export function getIdentityKeyForFile(file: AudioFileIdentityInput): string {
+  const database = getDb()
+  const normalizedRelativePath = normalizePath(file.relativePath)
+  const stableKey = buildIdentityKey(file)
+  const legacyKey = buildLegacyIdentityKey(file)
+
+  const byStable = database.prepare(`
+    SELECT identity_key
+    FROM audio_files
+    WHERE identity_key = ?
+    LIMIT 1
+  `).get(stableKey) as { identity_key: string } | undefined
+
+  if (byStable?.identity_key) {
+    return byStable.identity_key
+  }
+
+  const byPathAndSize = database.prepare(`
+    SELECT identity_key
+    FROM audio_files
+    WHERE relative_path = ? AND size = ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).get(normalizedRelativePath, file.size) as { identity_key: string } | undefined
+
+  if (byPathAndSize?.identity_key) {
+    return byPathAndSize.identity_key
+  }
+
+  const byLegacy = database.prepare(`
+    SELECT identity_key
+    FROM audio_files
+    WHERE identity_key = ?
+    LIMIT 1
+  `).get(legacyKey) as { identity_key: string } | undefined
+
+  if (byLegacy?.identity_key) {
+    return byLegacy.identity_key
+  }
+
+  return stableKey
 }
 
 export function upsertAudioFiles(files: AudioFileIdentityInput[]): void {
@@ -94,8 +142,9 @@ export function upsertAudioFiles(files: AudioFileIdentityInput[]): void {
 
   const tx = database.transaction((rows: AudioFileIdentityInput[]) => {
     for (const row of rows) {
+      const identityKey = getIdentityKeyForFile(row)
       stmt.run({
-        identity_key: buildIdentityKey(row),
+        identity_key: identityKey,
         name: row.name,
         relative_path: normalizePath(row.relativePath),
         size: row.size,
@@ -180,7 +229,7 @@ export function getLibraryItemsWithStatusForFiles(
       ...file,
       relativePath: normalizePath(file.relativePath),
     }
-    dedupedByIdentity.set(buildIdentityKey(normalized), normalized)
+    dedupedByIdentity.set(getIdentityKeyForFile(normalized), normalized)
   }
 
   const items: SyncedLibraryItem[] = []
