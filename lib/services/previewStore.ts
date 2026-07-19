@@ -17,6 +17,28 @@ export interface SyncedLibraryItem extends AudioFileIdentityInput {
   lastGeneratedAt: string | null
 }
 
+export interface LibrarySourceInput {
+  sourceType: string
+  sourceLabel?: string | null
+  deviceLabel?: string | null
+}
+
+export interface StoredLibrarySource {
+  sourceType: string
+  sourceLabel: string | null
+  deviceLabel: string | null
+  lastSyncedAt: string
+}
+
+export interface PairingSession {
+  pairingToken: string
+  expiresAt: string
+}
+
+export type PairingCompletionResult =
+  | { status: 'paired'; ownerToken: string }
+  | { status: 'invalid' | 'expired' | 'used' }
+
 export interface StoredChunkRow {
   minuteIndex: number
   status: 'done' | 'error'
@@ -58,6 +80,35 @@ function getDb(): Database.Database {
       updated_at TEXT NOT NULL,
       PRIMARY KEY (identity_key, minute_index),
       FOREIGN KEY(identity_key) REFERENCES audio_files(identity_key) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_library_files (
+      owner_token TEXT NOT NULL,
+      identity_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      last_modified INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (owner_token, identity_key),
+      FOREIGN KEY(identity_key) REFERENCES audio_files(identity_key) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_sources (
+      owner_token TEXT PRIMARY KEY,
+      source_type TEXT NOT NULL,
+      source_label TEXT,
+      device_label TEXT,
+      last_synced_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pairing_sessions (
+      pairing_token TEXT PRIMARY KEY,
+      owner_token TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
     );
   `)
 
@@ -157,6 +208,268 @@ export function upsertAudioFiles(files: AudioFileIdentityInput[]): void {
   tx(files)
 }
 
+function buildLibraryItem(
+  row: {
+    identity_key: string
+    name: string
+    relative_path: string
+    size: number
+    last_modified: number
+  },
+  previewLength: number
+): SyncedLibraryItem {
+  const maxReadyMinutes = getContiguousReadyMinutes(row.identity_key, previewLength)
+
+  return {
+    identityKey: row.identity_key,
+    name: row.name,
+    relativePath: row.relative_path,
+    size: row.size,
+    lastModified: row.last_modified,
+    maxReadyMinutes,
+    hasFullPreview: maxReadyMinutes >= previewLength,
+    lastGeneratedAt: getLastGeneratedAt(row.identity_key),
+  }
+}
+
+function normalizeLibrarySource(source: LibrarySourceInput | null | undefined): LibrarySourceInput | null {
+  if (!source) {
+    return null
+  }
+
+  const sourceType = source.sourceType.trim()
+
+  if (!sourceType) {
+    return null
+  }
+
+  return {
+    sourceType,
+    sourceLabel: source.sourceLabel?.trim() || null,
+    deviceLabel: source.deviceLabel?.trim() || null,
+  }
+}
+
+export function replaceOwnerLibrary(
+  ownerToken: string,
+  files: AudioFileIdentityInput[],
+  source?: LibrarySourceInput | null
+): void {
+  const database = getDb()
+  const now = new Date().toISOString()
+  const normalizedSource = normalizeLibrarySource(source)
+  const dedupedByIdentity = new Map<string, AudioFileIdentityInput>()
+
+  for (const file of files) {
+    const normalized: AudioFileIdentityInput = {
+      ...file,
+      relativePath: normalizePath(file.relativePath),
+    }
+    dedupedByIdentity.set(getIdentityKeyForFile(normalized), normalized)
+  }
+
+  upsertAudioFiles(Array.from(dedupedByIdentity.values()))
+
+  const insertLibraryFile = database.prepare(`
+    INSERT INTO owner_library_files (
+      owner_token,
+      identity_key,
+      name,
+      relative_path,
+      size,
+      last_modified,
+      updated_at
+    )
+    VALUES (
+      @owner_token,
+      @identity_key,
+      @name,
+      @relative_path,
+      @size,
+      @last_modified,
+      @updated_at
+    )
+  `)
+
+  const upsertSource = database.prepare(`
+    INSERT INTO owner_sources (
+      owner_token,
+      source_type,
+      source_label,
+      device_label,
+      last_synced_at,
+      updated_at
+    )
+    VALUES (
+      @owner_token,
+      @source_type,
+      @source_label,
+      @device_label,
+      @last_synced_at,
+      @updated_at
+    )
+    ON CONFLICT(owner_token) DO UPDATE SET
+      source_type = excluded.source_type,
+      source_label = excluded.source_label,
+      device_label = excluded.device_label,
+      last_synced_at = excluded.last_synced_at,
+      updated_at = excluded.updated_at
+  `)
+
+  const tx = database.transaction(() => {
+    database.prepare(`
+      DELETE FROM owner_library_files
+      WHERE owner_token = ?
+    `).run(ownerToken)
+
+    for (const [identityKey, file] of dedupedByIdentity.entries()) {
+      insertLibraryFile.run({
+        owner_token: ownerToken,
+        identity_key: identityKey,
+        name: file.name,
+        relative_path: file.relativePath,
+        size: file.size,
+        last_modified: file.lastModified,
+        updated_at: now,
+      })
+    }
+
+    if (normalizedSource) {
+      upsertSource.run({
+        owner_token: ownerToken,
+        source_type: normalizedSource.sourceType,
+        source_label: normalizedSource.sourceLabel,
+        device_label: normalizedSource.deviceLabel,
+        last_synced_at: now,
+        updated_at: now,
+      })
+    }
+  })
+
+  tx()
+}
+
+export function getOwnerLibrarySource(ownerToken: string): StoredLibrarySource | null {
+  const database = getDb()
+  const row = database.prepare(`
+    SELECT source_type, source_label, device_label, last_synced_at
+    FROM owner_sources
+    WHERE owner_token = ?
+    LIMIT 1
+  `).get(ownerToken) as {
+    source_type: string
+    source_label: string | null
+    device_label: string | null
+    last_synced_at: string
+  } | undefined
+
+  if (!row) {
+    return null
+  }
+
+  return {
+    sourceType: row.source_type,
+    sourceLabel: row.source_label,
+    deviceLabel: row.device_label,
+    lastSyncedAt: row.last_synced_at,
+  }
+}
+
+export function getOwnerLibraryItemsWithStatus(
+  ownerToken: string,
+  previewLength: number
+): SyncedLibraryItem[] {
+  const database = getDb()
+  const rows = database.prepare(`
+    SELECT identity_key, name, relative_path, size, last_modified
+    FROM owner_library_files
+    WHERE owner_token = ?
+    ORDER BY relative_path ASC
+  `).all(ownerToken) as Array<{
+    identity_key: string
+    name: string
+    relative_path: string
+    size: number
+    last_modified: number
+  }>
+
+  return rows.map((row) => buildLibraryItem(row, previewLength))
+}
+
+export function createPairingSession(
+  ownerToken: string,
+  pairingToken: string,
+  ttlMs: number
+): PairingSession {
+  const database = getDb()
+  const createdAt = new Date()
+  const expiresAt = new Date(createdAt.getTime() + ttlMs)
+
+  database.prepare(`
+    INSERT INTO pairing_sessions (
+      pairing_token,
+      owner_token,
+      created_at,
+      expires_at,
+      used_at
+    )
+    VALUES (?, ?, ?, ?, NULL)
+  `).run(
+    pairingToken,
+    ownerToken,
+    createdAt.toISOString(),
+    expiresAt.toISOString()
+  )
+
+  return {
+    pairingToken,
+    expiresAt: expiresAt.toISOString(),
+  }
+}
+
+export function consumePairingSession(pairingToken: string): PairingCompletionResult {
+  const database = getDb()
+  const now = new Date().toISOString()
+
+  const tx = database.transaction((token: string): PairingCompletionResult => {
+    const row = database.prepare(`
+      SELECT owner_token, expires_at, used_at
+      FROM pairing_sessions
+      WHERE pairing_token = ?
+      LIMIT 1
+    `).get(token) as {
+      owner_token: string
+      expires_at: string
+      used_at: string | null
+    } | undefined
+
+    if (!row) {
+      return { status: 'invalid' }
+    }
+
+    if (row.used_at) {
+      return { status: 'used' }
+    }
+
+    if (row.expires_at <= now) {
+      return { status: 'expired' }
+    }
+
+    database.prepare(`
+      UPDATE pairing_sessions
+      SET used_at = ?
+      WHERE pairing_token = ?
+    `).run(now, token)
+
+    return {
+      status: 'paired',
+      ownerToken: row.owner_token,
+    }
+  })
+
+  return tx(pairingToken)
+}
+
 function getContiguousReadyMinutes(identityKey: string, upToMinutes: number): number {
   const database = getDb()
   const rows = database.prepare(`
@@ -203,19 +516,7 @@ export function getLibraryItemsWithStatus(previewLength: number): SyncedLibraryI
     last_modified: number
   }>
 
-  return rows.map((row) => {
-    const maxReadyMinutes = getContiguousReadyMinutes(row.identity_key, previewLength)
-    return {
-      identityKey: row.identity_key,
-      name: row.name,
-      relativePath: row.relative_path,
-      size: row.size,
-      lastModified: row.last_modified,
-      maxReadyMinutes,
-      hasFullPreview: maxReadyMinutes >= previewLength,
-      lastGeneratedAt: getLastGeneratedAt(row.identity_key),
-    }
-  })
+  return rows.map((row) => buildLibraryItem(row, previewLength))
 }
 
 export function getLibraryItemsWithStatusForFiles(
@@ -235,17 +536,13 @@ export function getLibraryItemsWithStatusForFiles(
   const items: SyncedLibraryItem[] = []
 
   for (const [identityKey, file] of dedupedByIdentity.entries()) {
-    const maxReadyMinutes = getContiguousReadyMinutes(identityKey, previewLength)
-    items.push({
-      identityKey,
+    items.push(buildLibraryItem({
+      identity_key: identityKey,
       name: file.name,
-      relativePath: file.relativePath,
+      relative_path: file.relativePath,
       size: file.size,
-      lastModified: file.lastModified,
-      maxReadyMinutes,
-      hasFullPreview: maxReadyMinutes >= previewLength,
-      lastGeneratedAt: getLastGeneratedAt(identityKey),
-    })
+      last_modified: file.lastModified,
+    }, previewLength))
   }
 
   items.sort((a, b) => a.relativePath.localeCompare(b.relativePath))

@@ -14,6 +14,8 @@ The app currently supports MP3 input, splits the selected preview window into 1-
 
 - Select an MP3 folder from the browser (persistent on supported browsers).
 - Automatic folder restore on next app open (Android Chrome / PWA).
+- Server-saved shared library list that can be reopened on another paired device.
+- QR-based anonymous device pairing for sharing one library between desktop and phone.
 - Manual Refresh action to re-scan folder contents after updates.
 - Select preview length: 3, 5, or 10 minutes.
 - Incremental preview generation (reuses existing minutes and generates only missing minutes).
@@ -151,12 +153,31 @@ Request JSON:
 }
 ```
 
+### GET /api/library
+
+Returns the current owner-scoped saved library and active source metadata for the selected preview length.
+
+Query params:
+
+- `previewLength`: one of `3`, `5`, `10`
+
+### POST /api/pair/start
+
+Creates a short-lived pairing session for the current anonymous owner and returns a QR-friendly pairing URL.
+
+### POST /api/pair/complete
+
+Consumes a pairing token and binds the current device to the same anonymous owner as the device that created the QR code.
+
 ## Project Structure
 
 ```text
 app/
+	api/library/route.ts               # GET endpoint: load shared saved library
 	api/transcribe/route.ts            # POST endpoint: create + start job
 	api/transcribe/[jobId]/route.ts    # GET endpoint: poll job state
+	api/pair/start/route.ts            # POST endpoint: start QR pairing
+	api/pair/complete/route.ts         # POST endpoint: consume QR pairing token
 	page.tsx                           # Main client UI and polling logic
 components/
 	AudioSelector.tsx                     # Folder select + refresh controls
@@ -171,6 +192,8 @@ lib/services/
 	ffmpeg.ts                          # FFmpeg wrapper
 	assembly.ts                        # AssemblyAI integration
 	openai.ts                          # Transcript formatting provider (Gemini/OpenAI)
+lib/server/
+	ownerSession.ts                    # Anonymous owner cookie helper
 app/api/library/sync/route.ts          # Folder library sync endpoint
 public/
 	manifest.json

@@ -1,12 +1,15 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import Image from 'next/image'
+import { useState, useEffect, useRef, useCallback, useMemo, useSyncExternalStore } from 'react'
+import QRCode from 'qrcode'
 import AudioSelector from '@/components/AudioSelector'
 import PreviewLengthSelector from '@/components/PreviewLengthSelector'
 import GenerateButton from '@/components/GenerateButton'
 import ProgressIndicator from '@/components/ProgressIndicator'
 import TranscriptViewer from '@/components/TranscriptViewer'
 import { loadFolderHandle, saveFolderHandle } from '@/lib/client/folderHandleStore'
+import { loadOwnerToken, saveOwnerToken } from '@/lib/client/ownerTokenStore'
 import {
   type ClientAudioFile,
   listMp3FilesFromFileList,
@@ -38,6 +41,19 @@ interface LibraryItem {
   file: File | null
 }
 
+interface LibrarySource {
+  sourceType: string
+  sourceLabel: string | null
+  deviceLabel: string | null
+  lastSyncedAt: string
+}
+
+interface SyncSourceInput {
+  sourceType: string
+  sourceLabel?: string | null
+  deviceLabel?: string | null
+}
+
 const POLL_INTERVAL_MS = 2000
 
 function buildIdentityKey(file: {
@@ -47,11 +63,79 @@ function buildIdentityKey(file: {
   return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}`
 }
 
-function buildStatusLookupKey(file: {
-  relativePath: string
-  size: number
-}): string {
-  return `${file.relativePath.replace(/\\/g, '/').trim()}::${file.size}`
+function getDeviceLabel(): string {
+  if (typeof navigator === 'undefined') {
+    return 'This device'
+  }
+
+  const userAgent = navigator.userAgent
+
+  if (/android/i.test(userAgent)) {
+    return 'Android device'
+  }
+
+  if (/iphone|ipad|ipod/i.test(userAgent)) {
+    return 'iPhone or iPad'
+  }
+
+  if (/mobile/i.test(userAgent)) {
+    return 'Mobile device'
+  }
+
+  return 'Desktop browser'
+}
+
+function deriveFileInputSourceLabel(files: ClientAudioFile[]): string | null {
+  const firstPath = files[0]?.relativePath ?? ''
+  const segments = firstPath.split('/').filter(Boolean)
+
+  if (segments.length >= 2) {
+    return segments[0]
+  }
+
+  return null
+}
+
+function parseLibrarySource(value: unknown): LibrarySource | null {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const source = value as Record<string, unknown>
+
+  if (typeof source.sourceType !== 'string' || typeof source.lastSyncedAt !== 'string') {
+    return null
+  }
+
+  return {
+    sourceType: source.sourceType,
+    sourceLabel: typeof source.sourceLabel === 'string' ? source.sourceLabel : null,
+    deviceLabel: typeof source.deviceLabel === 'string' ? source.deviceLabel : null,
+    lastSyncedAt: source.lastSyncedAt,
+  }
+}
+
+function describeLibrarySource(source: LibrarySource | null): string {
+  if (!source) {
+    return 'server library'
+  }
+
+  const label = source.sourceLabel || source.sourceType
+  const device = source.deviceLabel ? ` on ${source.deviceLabel}` : ''
+
+  return `${label}${device}`
+}
+
+function subscribeDirectoryPickerSupport(): () => void {
+  return () => undefined
+}
+
+function getDirectoryPickerSupportSnapshot(): boolean {
+  return 'showDirectoryPicker' in window
+}
+
+function getDirectoryPickerSupportServerSnapshot(): boolean {
+  return false
 }
 
 async function parseApiJson(response: Response): Promise<Record<string, unknown>> {
@@ -71,10 +155,33 @@ async function parseApiJson(response: Response): Promise<Record<string, unknown>
   }
 }
 
+async function fetchWithOwnerToken(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers)
+  const ownerToken = loadOwnerToken()
+
+  if (ownerToken) {
+    headers.set('x-shiur-owner-token', ownerToken)
+  }
+
+  const response = await fetch(input, {
+    ...init,
+    headers,
+    credentials: 'same-origin',
+  })
+
+  const nextOwnerToken = response.headers.get('x-shiur-owner-token')?.trim()
+  if (nextOwnerToken) {
+    saveOwnerToken(nextOwnerToken)
+  }
+
+  return response
+}
+
 export default function Home() {
   const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([])
   const [selectedIdentity, setSelectedIdentity] = useState<string | null>(null)
   const [folderHandle, setFolderHandle] = useState<FileSystemDirectoryHandle | null>(null)
+  const [librarySource, setLibrarySource] = useState<LibrarySource | null>(null)
   const [folderStatus, setFolderStatus] = useState<string>('')
   const [isSyncingLibrary, setIsSyncingLibrary] = useState(false)
   const [previewLength, setPreviewLength] = useState(5)
@@ -82,13 +189,22 @@ export default function Home() {
   const [jobState, setJobState] = useState<JobState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isStartingPairing, setIsStartingPairing] = useState(false)
+  const [isCompletingPairing, setIsCompletingPairing] = useState(false)
+  const [pairingQrDataUrl, setPairingQrDataUrl] = useState<string | null>(null)
+  const [pairingUrl, setPairingUrl] = useState<string | null>(null)
+  const [pairingExpiresAt, setPairingExpiresAt] = useState<string | null>(null)
+  const [pairingMessage, setPairingMessage] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const filesRef = useRef<ClientAudioFile[]>([])
-
-  const supportsDirectoryPicker = useMemo(
-    () => typeof window !== 'undefined' && 'showDirectoryPicker' in window,
-    []
+  const lastSourceRef = useRef<SyncSourceInput | null>(null)
+  const completedPairTokenRef = useRef<string | null>(null)
+  const supportsDirectoryPicker = useSyncExternalStore(
+    subscribeDirectoryPickerSupport,
+    getDirectoryPickerSupportSnapshot,
+    getDirectoryPickerSupportServerSnapshot
   )
+  const deviceLabel = useMemo(() => getDeviceLabel(), [])
 
   const selectedItem = selectedIdentity
     ? libraryItems.find((item) => item.identityKey === selectedIdentity) ?? null
@@ -106,11 +222,24 @@ export default function Home() {
         : 'Generate Preview'
     : 'Generate Preview'
 
-  const effectiveFolderStatus = folderStatus || (
-    supportsDirectoryPicker
+  const effectiveFolderStatus = useMemo(() => {
+    if (folderStatus) {
+      return folderStatus
+    }
+
+    if (libraryItems.length > 0 && !folderHandle) {
+      return `Showing the shared server library from ${describeLibrarySource(librarySource)}. Reconnect this device's folder to rescan locally.`
+    }
+
+    return supportsDirectoryPicker
       ? 'No folder selected yet.'
       : 'Persistent folder restore is unavailable in this browser. Use file input mode.'
-  )
+  }, [folderHandle, folderStatus, libraryItems.length, librarySource, supportsDirectoryPicker])
+
+  const refreshLabel = supportsDirectoryPicker ? 'Refresh folder' : 'Reload saved list'
+  const selectorHelperText = supportsDirectoryPicker
+    ? 'Pick one folder once, then use Refresh to re-scan if new MP3 files were added.'
+    : 'Firefox-style fallback: the selected file list is saved on the server. Use Reload saved list to restore it, or select files again if the folder contents changed.'
 
   const stopPolling = useCallback(() => {
     if (pollRef.current !== null) {
@@ -138,8 +267,94 @@ export default function Home() {
     []
   )
 
-  const syncLibraryWithServer = useCallback(async (files: ClientAudioFile[]) => {
-    const res = await fetch('/api/library/sync', {
+  const applyLibraryPayload = useCallback((
+    data: Record<string, unknown>,
+    localFiles: ClientAudioFile[] = []
+  ) => {
+    const source = parseLibrarySource(data.source)
+    setLibrarySource(source)
+
+    const localFilesByIdentity = new Map(
+      localFiles.map((file) => [buildIdentityKey(file), file.file] as const)
+    )
+
+    const nextItems: LibraryItem[] = []
+
+    if (Array.isArray(data.items)) {
+      for (const item of data.items) {
+        if (!item || typeof item !== 'object') {
+          continue
+        }
+
+        const typedItem = item as Record<string, unknown>
+        if (
+          typeof typedItem.identityKey !== 'string' ||
+          typeof typedItem.name !== 'string' ||
+          typeof typedItem.relativePath !== 'string' ||
+          typeof typedItem.size !== 'number' ||
+          typeof typedItem.lastModified !== 'number'
+        ) {
+          continue
+        }
+
+        nextItems.push({
+          identityKey: typedItem.identityKey,
+          name: typedItem.name,
+          relativePath: typedItem.relativePath,
+          size: typedItem.size,
+          lastModified: typedItem.lastModified,
+          maxReadyMinutes: Number(typedItem.maxReadyMinutes ?? 0),
+          hasFullPreview: Boolean(typedItem.hasFullPreview),
+          file: localFilesByIdentity.get(typedItem.identityKey) ?? null,
+        })
+      }
+    }
+
+    setLibraryItems(nextItems)
+    setSelectedIdentity((previous) => {
+      if (previous && nextItems.some((item) => item.identityKey === previous)) {
+        return previous
+      }
+
+      return nextItems[0]?.identityKey ?? null
+    })
+
+    return {
+      count: nextItems.length,
+      source,
+    }
+  }, [])
+
+  const loadLibraryFromServer = useCallback(async (updateStatus: boolean) => {
+    const res = await fetchWithOwnerToken(`/api/library?previewLength=${previewLength}`)
+    const data = await parseApiJson(res)
+
+    if (!res.ok) {
+      throw new Error(
+        typeof data.error === 'string'
+          ? data.error
+          : `Library load failed with status ${res.status}`
+      )
+    }
+
+    const next = applyLibraryPayload(data)
+
+    if (updateStatus) {
+      if (next.count > 0) {
+        setFolderStatus(`Loaded ${next.count} MP3 files from ${describeLibrarySource(next.source)}.`)
+      } else {
+        setFolderStatus('No MP3 files are stored on the server yet.')
+      }
+    }
+
+    return next.count
+  }, [applyLibraryPayload, previewLength])
+
+  const syncLibraryWithServer = useCallback(async (
+    files: ClientAudioFile[],
+    source?: SyncSourceInput | null
+  ) => {
+    const res = await fetchWithOwnerToken('/api/library/sync', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -152,6 +367,7 @@ export default function Home() {
           size: file.size,
           lastModified: file.lastModified,
         })),
+        source,
       }),
     })
 
@@ -165,63 +381,9 @@ export default function Home() {
       )
     }
 
-    const statusMap = new Map<string, {
-      maxReadyMinutes: number
-      hasFullPreview: boolean
-    }>()
-
-    if (Array.isArray(data.items)) {
-      for (const item of data.items) {
-        if (!item || typeof item !== 'object' || typeof item.identityKey !== 'string') {
-          continue
-        }
-
-        const typedItem = item as {
-          relativePath?: unknown
-          size?: unknown
-          maxReadyMinutes?: unknown
-          hasFullPreview?: unknown
-        }
-
-        if (typeof typedItem.relativePath !== 'string' || typeof typedItem.size !== 'number') {
-          continue
-        }
-
-        statusMap.set(buildStatusLookupKey({
-          relativePath: typedItem.relativePath,
-          size: typedItem.size,
-        }), {
-          maxReadyMinutes: Number(item.maxReadyMinutes ?? 0),
-          hasFullPreview: Boolean(item.hasFullPreview),
-        })
-      }
-    }
-
-    const mergedItems: LibraryItem[] = files.map((file) => {
-      const identityKey = buildIdentityKey(file)
-      const status = statusMap.get(buildStatusLookupKey(file))
-      return {
-        identityKey,
-        name: file.name,
-        relativePath: file.relativePath,
-        size: file.size,
-        lastModified: file.lastModified,
-        maxReadyMinutes: status?.maxReadyMinutes ?? 0,
-        hasFullPreview: status?.hasFullPreview ?? false,
-        file: file.file,
-      }
-    })
-
-    setLibraryItems(mergedItems)
-    setSelectedIdentity((previous) => {
-      if (previous && mergedItems.some((item) => item.identityKey === previous)) {
-        return previous
-      }
-      return mergedItems[0]?.identityKey ?? null
-    })
-
-    return mergedItems.length
-  }, [previewLength])
+    lastSourceRef.current = source ?? null
+    return applyLibraryPayload(data, files).count
+  }, [applyLibraryPayload, previewLength])
 
   const refreshFromHandle = useCallback(
     async (handle: FileSystemDirectoryHandle, requestPermission: boolean) => {
@@ -238,13 +400,17 @@ export default function Home() {
         const files = await listMp3FilesFromHandle(handle)
         filesRef.current = files
 
-        const count = await syncLibraryWithServer(files)
+        const count = await syncLibraryWithServer(files, {
+          sourceType: 'directory-handle',
+          sourceLabel: handle.name,
+          deviceLabel,
+        })
         setFolderStatus(`Loaded ${count} MP3 files from saved folder.`)
       } finally {
         setIsSyncingLibrary(false)
       }
     },
-    [ensureReadPermission, syncLibraryWithServer]
+    [deviceLabel, ensureReadPermission, syncLibraryWithServer]
   )
 
   const pollJob = useCallback(async (id: string) => {
@@ -269,7 +435,7 @@ export default function Home() {
 
         if (filesRef.current.length > 0) {
           try {
-            await syncLibraryWithServer(filesRef.current)
+            await syncLibraryWithServer(filesRef.current, lastSourceRef.current)
           } catch {
             // Ignore status refresh errors after completed jobs.
           }
@@ -291,6 +457,24 @@ export default function Home() {
     pollRef.current = setInterval(() => pollJob(jobId), POLL_INTERVAL_MS)
     return () => stopPolling()
   }, [jobId, pollJob, stopPolling])
+
+  useEffect(() => {
+    let cancelled = false
+
+    void (async () => {
+      try {
+        await loadLibraryFromServer(true)
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to load saved library.')
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [loadLibraryFromServer])
 
   useEffect(() => {
     if (!supportsDirectoryPicker) {
@@ -324,17 +508,75 @@ export default function Home() {
 
   useEffect(() => {
     if (filesRef.current.length === 0) {
+      if (libraryItems.length === 0) {
+        return
+      }
+
+      void (async () => {
+        try {
+          await loadLibraryFromServer(false)
+        } catch {
+          // Ignore silent refresh failures when only changing preview length.
+        }
+      })()
+
       return
     }
 
     void (async () => {
       try {
-        await syncLibraryWithServer(filesRef.current)
+        await syncLibraryWithServer(filesRef.current, lastSourceRef.current)
       } catch {
         // Ignore silent refresh failures when only changing preview length.
       }
     })()
-  }, [previewLength, syncLibraryWithServer])
+  }, [libraryItems.length, loadLibraryFromServer, previewLength, syncLibraryWithServer])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const pairToken = params.get('pairToken')
+
+    if (!pairToken || completedPairTokenRef.current === pairToken) {
+      return
+    }
+
+    completedPairTokenRef.current = pairToken
+    setIsCompletingPairing(true)
+    setPairingMessage('Connecting this device to the shared library...')
+
+    void (async () => {
+      try {
+        const res = await fetch('/api/pair/complete', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ pairingToken: pairToken }),
+        })
+
+        const data = await parseApiJson(res)
+
+        if (!res.ok) {
+          throw new Error(
+            typeof data.error === 'string'
+              ? data.error
+              : `Pairing failed with status ${res.status}`
+          )
+        }
+
+        setPairingMessage('This device is now linked to the shared library.')
+        setFolderStatus('Device paired. Select the local folder on this device to enable local refresh.')
+        await loadLibraryFromServer(true)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to pair this device.')
+      } finally {
+        const nextUrl = new URL(window.location.href)
+        nextUrl.searchParams.delete('pairToken')
+        window.history.replaceState({}, '', `${nextUrl.pathname}${nextUrl.search}`)
+        setIsCompletingPairing(false)
+      }
+    })()
+  }, [loadLibraryFromServer])
 
   const handlePickDirectory = useCallback(async () => {
     if (!supportsDirectoryPicker) {
@@ -358,7 +600,11 @@ export default function Home() {
       const files = await listMp3FilesFromHandle(handle)
       filesRef.current = files
 
-      const count = await syncLibraryWithServer(files)
+      const count = await syncLibraryWithServer(files, {
+        sourceType: 'directory-handle',
+        sourceLabel: handle.name,
+        deviceLabel,
+      })
       setFolderStatus(`Selected folder with ${count} MP3 files.`)
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -368,7 +614,7 @@ export default function Home() {
     } finally {
       setIsSyncingLibrary(false)
     }
-  }, [ensureReadPermission, supportsDirectoryPicker, syncLibraryWithServer])
+  }, [deviceLabel, ensureReadPermission, supportsDirectoryPicker, syncLibraryWithServer])
 
   const handleFallbackSelect = useCallback(async (fileList: FileList) => {
     setError(null)
@@ -376,18 +622,35 @@ export default function Home() {
 
     try {
       const files = listMp3FilesFromFileList(fileList)
-      filesRef.current = files
+      filesRef.current = supportsDirectoryPicker ? files : []
 
-      const count = await syncLibraryWithServer(files)
+      const count = await syncLibraryWithServer(files, {
+        sourceType: 'file-input',
+        sourceLabel: deriveFileInputSourceLabel(files),
+        deviceLabel,
+      })
       setFolderStatus(`Loaded ${count} MP3 files from file input.`)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load selected files.')
     } finally {
       setIsSyncingLibrary(false)
     }
-  }, [syncLibraryWithServer])
+  }, [deviceLabel, supportsDirectoryPicker, syncLibraryWithServer])
 
   const handleRefresh = useCallback(async () => {
+    if (!supportsDirectoryPicker) {
+      if (libraryItems.length > 0) {
+        try {
+          const count = await loadLibraryFromServer(true)
+          setFolderStatus(`Reloaded ${count} MP3 files from the saved server list.`)
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Failed to reload saved library.')
+        }
+      }
+
+      return
+    }
+
     if (folderHandle) {
       try {
         await refreshFromHandle(folderHandle, true)
@@ -399,13 +662,64 @@ export default function Home() {
 
     if (filesRef.current.length > 0) {
       try {
-        await syncLibraryWithServer(filesRef.current)
+        await syncLibraryWithServer(filesRef.current, lastSourceRef.current)
         setFolderStatus(`Refreshed ${filesRef.current.length} MP3 files.`)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to refresh file list.')
       }
+
+      return
     }
-  }, [folderHandle, refreshFromHandle, syncLibraryWithServer])
+
+    if (libraryItems.length > 0) {
+      try {
+        const count = await loadLibraryFromServer(true)
+        setFolderStatus(`Reloaded ${count} MP3 files from the shared server library.`)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to reload saved library.')
+      }
+    }
+  }, [folderHandle, libraryItems.length, loadLibraryFromServer, refreshFromHandle, supportsDirectoryPicker, syncLibraryWithServer])
+
+  const handleStartPairing = useCallback(async () => {
+    setError(null)
+    setIsStartingPairing(true)
+
+    try {
+      const res = await fetchWithOwnerToken('/api/pair/start', {
+        method: 'POST',
+      })
+
+      const data = await parseApiJson(res)
+
+      if (!res.ok) {
+        throw new Error(
+          typeof data.error === 'string'
+            ? data.error
+            : `Pairing start failed with status ${res.status}`
+        )
+      }
+
+      const nextPairingUrl = typeof data.pairingUrl === 'string' ? data.pairingUrl : ''
+      if (!nextPairingUrl) {
+        throw new Error('Pairing endpoint did not return a URL.')
+      }
+
+      const qrDataUrl = await QRCode.toDataURL(nextPairingUrl, {
+        margin: 1,
+        width: 220,
+      })
+
+      setPairingUrl(nextPairingUrl)
+      setPairingQrDataUrl(qrDataUrl)
+      setPairingExpiresAt(typeof data.expiresAt === 'string' ? data.expiresAt : null)
+      setPairingMessage('Scan this QR code on your phone to share the same library.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start device pairing.')
+    } finally {
+      setIsStartingPairing(false)
+    }
+  }, [])
 
   const handleGenerate = useCallback(async () => {
     if (!selectedItem) {
@@ -489,9 +803,57 @@ export default function Home() {
           supportsDirectoryPicker={supportsDirectoryPicker}
           isSyncing={isSyncingLibrary}
           disabled={isProcessing}
+          refreshLabel={refreshLabel}
+          helperText={selectorHelperText}
         />
 
         <p className="text-xs text-gray-500">{effectiveFolderStatus}</p>
+
+        <div className="rounded-xl border border-sky-200 bg-sky-50 p-4 flex flex-col gap-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium text-sky-900">Pair another device</p>
+              <p className="text-xs text-sky-700">
+                Share the same server-side library with your phone via QR. Local folder access still has to be granted separately on each device.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleStartPairing}
+              disabled={isProcessing || isSyncingLibrary || isStartingPairing || isCompletingPairing}
+              className="px-4 py-2 rounded-lg bg-sky-600 text-white text-sm font-medium hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isStartingPairing ? 'Preparing QR...' : 'Show pairing QR'}
+            </button>
+          </div>
+
+          {pairingMessage && (
+            <p className="text-xs text-sky-800">{pairingMessage}</p>
+          )}
+
+          {pairingQrDataUrl && pairingUrl && (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <Image
+                src={pairingQrDataUrl}
+                alt="QR code for pairing this library with another device"
+                width={176}
+                height={176}
+                className="h-44 w-44 rounded-lg border border-sky-200 bg-white p-2"
+              />
+
+              <div className="min-w-0 flex-1 text-xs text-sky-900">
+                <p className="font-medium">Open on phone</p>
+                <p className="mt-1 break-all">{pairingUrl}</p>
+                {pairingExpiresAt && (
+                  <p className="mt-2 text-sky-700">
+                    Expires at {new Date(pairingExpiresAt).toLocaleString()}.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         <div className="flex flex-col gap-2">
           <p className="text-sm font-medium text-gray-700">MP3 files</p>

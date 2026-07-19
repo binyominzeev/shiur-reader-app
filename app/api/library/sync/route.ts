@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
-  getLibraryItemsWithStatusForFiles,
-  upsertAudioFiles,
+  getOwnerLibraryItemsWithStatus,
+  getOwnerLibrarySource,
+  replaceOwnerLibrary,
 } from '@/lib/services/previewStore'
-import type { AudioFileIdentityInput } from '@/lib/services/previewStore'
+import type { AudioFileIdentityInput, LibrarySourceInput } from '@/lib/services/previewStore'
+import { attachOwnerTokenCookie, getOrCreateOwnerToken } from '@/lib/server/ownerSession'
 
 export const runtime = 'nodejs'
 
@@ -12,6 +14,7 @@ const VALID_PREVIEW_LENGTHS = [3, 5, 10]
 type SyncRequestBody = {
   previewLength: number
   files: AudioFileIdentityInput[]
+  source?: LibrarySourceInput
 }
 
 function isValidFileInput(value: unknown): value is AudioFileIdentityInput {
@@ -58,12 +61,16 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'One or more files are invalid.' }, { status: 400 })
   }
 
-  upsertAudioFiles(files)
+  const { ownerToken, created } = getOrCreateOwnerToken(request)
+  replaceOwnerLibrary(ownerToken, files, body.source)
 
-  const items = getLibraryItemsWithStatusForFiles(files, previewLength)
-
-  return NextResponse.json({
-    items,
-    total: items.length,
+  const response = NextResponse.json({
+    items: getOwnerLibraryItemsWithStatus(ownerToken, previewLength),
+    total: files.length,
+    source: getOwnerLibrarySource(ownerToken),
   })
+
+  attachOwnerTokenCookie(response, ownerToken)
+
+  return response
 }
